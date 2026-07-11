@@ -1,0 +1,395 @@
+import streamlit as st
+import pandas as pd
+import glob
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+st.set_page_config(page_title="Performance Portal", layout="wide")
+
+# --- CUSTOM ENGINE FOR COMPREHENSIVE TEXT CENTERING & AUTO-STRETCH ---
+def render_custom_table(df, format_dict=None, highlight_cols=None, left_align_cols=None):
+    styler = df.style
+    if format_dict:
+        styler = styler.format(format_dict)
+    
+    # Default everything to center
+    styler = styler.set_properties(**{
+        'text-align': 'center',
+        'vertical-align': 'middle',
+        'padding': '12px',
+        'border': '1px solid #e6e9ef'
+    })
+    
+    # Apply left-alignment and no-wrap to specific columns
+    if left_align_cols:
+        for col in left_align_cols:
+            if col in df.columns:
+                styler = styler.set_properties(subset=[col], **{
+                    'text-align': 'left', 
+                    'white-space': 'nowrap'
+                })
+    
+    styler = styler.set_table_styles([
+        {'selector': 'th', 'props': [
+            ('text-align', 'center'), 
+            ('background-color', '#f8f9fa'), 
+            ('font-weight', 'bold'), 
+            ('padding', '12px'),
+            ('border', '1px solid #e6e9ef'),
+            ('color', '#1f2937')
+        ]},
+        {'selector': 'table', 'props': [
+            ('width', '100%'), 
+            ('border-collapse', 'collapse'),
+            ('margin', '10px 0')
+        ]}
+    ])
+    
+    if highlight_cols:
+        for col in highlight_cols:
+            if col in df.columns:
+                def highlight_max(s):
+                    is_max = s == s.max()
+                    return ['background-color: #28a745; color: white; font-weight: bold;' if (v and s.max() > 0) else '' for v in is_max]
+                styler = styler.apply(highlight_max, subset=[col])
+                
+    html = styler.hide(axis='index').to_html()
+    wrapped_html = f'<div style="width:100%; overflow-x:auto;">{html}</div>'
+    st.markdown(wrapped_html, unsafe_allow_html=True)
+
+# --- 1. DATA PROCESSING ENGINE ---
+@st.cache_data
+def load_and_merge_data():
+    dropzone = "./Load_Management_Dropzone"
+    
+    fb_files = glob.glob(f"{dropzone}/*firstbeat*.xlsx") + glob.glob(f"{dropzone}/*firstbeat*.csv")
+    kn_files = glob.glob(f"{dropzone}/*kinexon*.xlsx") + glob.glob(f"{dropzone}/*kinexon*.csv")
+    
+    if not fb_files or not kn_files:
+        return None, "Missing Firstbeat or Kinexon files in the dropzone."
+
+    try:
+        # Process Firstbeat
+        if fb_files[0].endswith('.csv'):
+            fb_df = pd.read_csv(fb_files[0])
+        else:
+            fb_df = pd.read_excel(fb_files[0])
+            
+        fb_df['Player'] = fb_df['Athlete name'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.title()
+        
+        # Regex replaces to handle spelling variations
+        fb_df['Player'] = fb_df['Player'].str.replace(r'Preston Murphy Jr.*', 'Preston Murphy Jr', regex=True)
+        fb_df['Player'] = fb_df['Player'].str.replace(r'Jaxs?on\s*Richardson.*', 'Jaxon Richardson', regex=True)
+        
+        fb_df['Date'] = pd.to_datetime(fb_df['Start date (dd.mm.yyyy)'], errors='coerce').dt.normalize()
+        
+        fb_agg = fb_df.groupby(['Player', 'Date']).agg({
+            'TRIMP (Index)': 'max', 
+            'Average HR (bpm)': 'mean',
+            'Peak HR (bpm)': 'max'
+        }).reset_index()
+
+        # Process Kinexon
+        if kn_files[0].endswith('.csv'):
+            kn_df = pd.read_csv(kn_files[0])
+        else:
+            kn_sheets = pd.read_excel(kn_files[0], sheet_name=None)
+            kn_df = pd.concat(kn_sheets.values(), ignore_index=True)
+
+        kn_df['Player'] = kn_df['Name'].astype(str).str.strip().str.replace(r'\s+', ' ', regex=True).str.title()
+        
+        # Regex replaces to handle spelling variations
+        kn_df['Player'] = kn_df['Player'].str.replace(r'Preston Murphy Jr.*', 'Preston Murphy Jr', regex=True)
+        kn_df['Player'] = kn_df['Player'].str.replace(r'Jaxs?on\s*Richardson.*', 'Jaxon Richardson', regex=True)
+        
+        kn_df['Date'] = pd.to_datetime(kn_df['Session begin (Local timezone)'], errors='coerce').dt.normalize()
+        
+        # Detect vertical metric data
+        jump_cols = [c for c in kn_df.columns if 'jump' in c.lower() and 'height' in c.lower()]
+        jump_col = jump_cols[0] if jump_cols else None
+        
+        kn_agg_dict = {
+            'Accumulated Acceleration Load': 'sum',
+            'Speed (max.) (mph)': 'max',
+            'Distance (mi)': 'sum'
+        }
+        
+        if jump_col:
+            kn_df[jump_col] = pd.to_numeric(kn_df[jump_col], errors='coerce').fillna(0)
+            kn_agg_dict[jump_col] = 'max'
+            
+        kn_agg = kn_df.groupby(['Player', 'Date']).agg(kn_agg_dict).reset_index()
+        
+        if jump_col:
+            kn_agg = kn_agg.rename(columns={jump_col: 'Max Jump Height'})
+        else:
+            kn_agg['Max Jump Height'] = 0.0
+
+        merged_df = pd.merge(fb_agg, kn_agg, on=['Player', 'Date'], how='outer')
+        merged_df = merged_df.dropna(subset=['Player'])
+        
+        # Remove Houston Mallette completely
+        merged_df = merged_df[merged_df['Player'] != 'Houston Mallette']
+        
+        return merged_df, "Success"
+
+    except Exception as e:
+        return None, f"Error processing data: {e}"
+
+# --- 2. DATA CALCULATION LAYER ---
+df, status = load_and_merge_data()
+
+if df is None:
+    st.error(status)
+    st.stop()
+
+df['TRIMP (Index)'] = pd.to_numeric(df['TRIMP (Index)'], errors='coerce').fillna(0)
+df['Accumulated Acceleration Load'] = pd.to_numeric(df['Accumulated Acceleration Load'], errors='coerce').fillna(0)
+df['Speed (max.) (mph)'] = pd.to_numeric(df['Speed (max.) (mph)'], errors='coerce').fillna(0)
+df['Max Jump Height'] = pd.to_numeric(df['Max Jump Height'], errors='coerce').fillna(0)
+df['Distance (mi)'] = pd.to_numeric(df['Distance (mi)'], errors='coerce').fillna(0)
+
+df['Date_Obj'] = pd.to_datetime(df['Date'])
+df = df.sort_values(['Player', 'Date_Obj'])
+
+df['Acute_TRIMP'] = df.groupby('Player')['TRIMP (Index)'].transform(lambda x: x.rolling(7, min_periods=1).mean())
+df['Chronic_TRIMP'] = df.groupby('Player')['TRIMP (Index)'].transform(lambda x: x.rolling(28, min_periods=1).mean())
+df['ACWR_TRIMP'] = df['Acute_TRIMP'] / df['Chronic_TRIMP'].replace(0, 1)
+
+df['Acute_Accel'] = df.groupby('Player')['Accumulated Acceleration Load'].transform(lambda x: x.rolling(7, min_periods=1).mean())
+df['Chronic_Accel'] = df.groupby('Player')['Accumulated Acceleration Load'].transform(lambda x: x.rolling(28, min_periods=1).mean())
+df['ACWR_Accel'] = df['Acute_Accel'] / df['Chronic_Accel'].replace(0, 1)
+
+df['Combined_ACWR'] = df[['ACWR_TRIMP', 'ACWR_Accel']].mean(axis=1, skipna=True)
+
+weekday_map = {0: 'M', 1: 'T', 2: 'W', 3: 'R', 4: 'F', 5: 'Sa', 6: 'Su'}
+df['Day_of_Week'] = df['Date_Obj'].dt.weekday.map(weekday_map)
+df['Date_Str'] = df['Date_Obj'].dt.strftime('%m/%d/%Y')
+day_order = ['M', 'T', 'W', 'R', 'F', 'Sa', 'Su']
+
+
+# --- 3. SIDEBAR CONFIGURATION ---
+st.sidebar.title("🏀 Portal Controls")
+
+date_options_df = df[['Date_Str', 'Date_Obj', 'Day_of_Week']].drop_duplicates().sort_values('Date_Obj', ascending=False)
+date_options_df['Dropdown_Label'] = date_options_df['Day_of_Week'] + " - " + date_options_df['Date_Str']
+
+selected_label = st.sidebar.selectbox("Choose Practice/Game Day:", date_options_df['Dropdown_Label'].tolist())
+selected_date_str = date_options_df[date_options_df['Dropdown_Label'] == selected_label]['Date_Str'].values[0]
+selected_date_obj = pd.to_datetime(selected_date_str)
+
+start_of_week = selected_date_obj - pd.Timedelta(days=selected_date_obj.weekday())
+end_of_week = start_of_week + pd.Timedelta(days=6)
+week_df = df[(df['Date_Obj'] >= start_of_week) & (df['Date_Obj'] <= end_of_week)]
+
+daily_avg = week_df.groupby('Day_of_Week').agg({
+    'TRIMP (Index)': 'mean',
+    'Accumulated Acceleration Load': 'mean',
+    'Distance (mi)': 'mean',
+    'Speed (max.) (mph)': 'max',
+    'Max Jump Height': 'max'
+}).reindex(day_order).fillna(0).reset_index()
+daily_avg.columns = ['Day', 'Avg TRIMP', 'Avg Accel Load', 'Avg Distance (mi)', 'Max Speed (mph)', 'Max Jump Height']
+
+# Identify the players with the highest speed and jump for each day
+top_speed_players = []
+top_jump_players = []
+
+for day in daily_avg['Day']:
+    day_df = week_df[week_df['Day_of_Week'] == day]
+    if not day_df.empty and day_df['Speed (max.) (mph)'].max() > 0:
+        top_speed_players.append(day_df.loc[day_df['Speed (max.) (mph)'].idxmax(), 'Player'])
+    else:
+        top_speed_players.append("-")
+        
+    if not day_df.empty and day_df['Max Jump Height'].max() > 0:
+        top_jump_players.append(day_df.loc[day_df['Max Jump Height'].idxmax(), 'Player'])
+    else:
+        top_jump_players.append("-")
+
+daily_avg['Speed Leader'] = top_speed_players
+daily_avg['Jump Leader'] = top_jump_players
+
+# Reorder columns to place leaders next to their metrics
+daily_avg = daily_avg[['Day', 'Avg TRIMP', 'Avg Accel Load', 'Avg Distance (mi)', 'Max Speed (mph)', 'Speed Leader', 'Max Jump Height', 'Jump Leader']]
+
+
+# --- 4. MAIN INTERFACE ---
+st.title("🏀 Integrated Performance Dashboard")
+st.markdown("---")
+
+tab_roster, tab_visuals, tab_individual = st.tabs([
+    "📋 Roster Readiness Status", 
+    "📈 Visual Analytics", 
+    "📊 Squad Baselines & Profiles"
+])
+
+# --- TAB 1: ROSTER READINESS STATUS ---
+with tab_roster:
+    roster_day = df[df['Date_Str'] == selected_date_str].copy()
+    
+    st.subheader(f"Status Matrix for Day: {selected_label}")
+    
+    def assign_status(row):
+        if row['Combined_ACWR'] > 1.5: return "🔴 High Stress"
+        elif row['Combined_ACWR'] >= 1.3: return "🟡 Caution"
+        else: return "🟢 Sweet Spot"
+            
+    if not roster_day.empty:
+        roster_day['Status'] = roster_day.apply(assign_status, axis=1)
+        
+        roster_display = roster_day[[
+            'Player', 'Status', 'TRIMP (Index)', 'Accumulated Acceleration Load', 
+            'ACWR_TRIMP', 'ACWR_Accel', 'Combined_ACWR'
+        ]].rename(columns={
+            'TRIMP (Index)': 'Cardio (TRIMP)',
+            'Accumulated Acceleration Load': 'Mech Load (Accel)',
+            'ACWR_TRIMP': 'Cardio ACWR',
+            'ACWR_Accel': 'Mech ACWR',
+            'Combined_ACWR': 'Combined ACWR'
+        })
+        
+        format_dict = {
+            'Cardio (TRIMP)': '{:.2f}', 'Mech Load (Accel)': '{:.2f}',
+            'Cardio ACWR': '{:.2f}', 'Mech ACWR': '{:.2f}', 'Combined ACWR': '{:.2f}'
+        }
+        
+        render_custom_table(roster_display, format_dict, left_align_cols=['Status'])
+    else:
+        st.info("No data recorded for this specific date.")
+
+# --- TAB 2: VISUAL ANALYTICS ---
+with tab_visuals:
+    roster_day = df[df['Date_Str'] == selected_date_str].copy()
+    
+    # Render the Team Stress Gauge at the top of the analytics tab
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        if not roster_day.empty:
+            team_acwr_today = roster_day['Combined_ACWR'].mean()
+            
+            gauge = go.Figure(go.Indicator(
+                mode = "gauge+number",
+                value = team_acwr_today,
+                domain = {'x': [0, 1], 'y': [0, 1]},
+                title = {'text': "Team Engine Stress", 'font': {'size': 20}},
+                number = {'valueformat': ".2f"},
+                gauge = {
+                    'axis': {'range': [0, 2.0], 'tickwidth': 1, 'tickcolor': "darkblue"},
+                    'bar': {'color': "gray"},
+                    'steps': [
+                        {'range': [0, 0.8], 'color': "#87CEFA"},
+                        {'range': [0.8, 1.3], 'color': "#90ee90"},
+                        {'range': [1.3, 1.5], 'color': "#ffd700"},
+                        {'range': [1.5, 2.0], 'color': "#ff6b6b"}
+                    ],
+                    'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 1.5}
+                }
+            ))
+            
+            gauge.update_layout(
+                height=280, 
+                margin=dict(l=20, r=20, t=50, b=40),
+                annotations=[
+                    go.layout.Annotation(text="ACWR", x=0.5, y=-0.1, showarrow=False, font=dict(size=14, color="gray"), xref="paper", yref="paper")
+                ]
+            )
+            st.plotly_chart(gauge, use_container_width=True)
+
+    st.markdown("---")
+    
+    st.subheader(f"🌊 The Weekly Training Wave (Week of {start_of_week.strftime('%m/%d')} - {end_of_week.strftime('%m/%d')})")
+    if not daily_avg.empty:
+        fig_wave = make_subplots(specs=[[{"secondary_y": True}]])
+        
+        fig_wave.add_trace(
+            go.Bar(x=daily_avg['Day'], y=daily_avg['Avg TRIMP'], text=daily_avg['Avg TRIMP'].map(lambda x: f"{x:.2f}"), textposition='auto', name="Avg Cardio Load (TRIMP)", marker_color='#ff4b4b', opacity=0.8),
+            secondary_y=False
+        )
+        fig_wave.add_trace(
+            go.Scatter(x=daily_avg['Day'], y=daily_avg['Avg Accel Load'], name="Avg Mech Load (Accel)", marker_color='#45B7D1', mode='lines+markers+text', text=daily_avg['Avg Accel Load'].map(lambda x: f"{x:.2f}"), textposition='top center', line=dict(width=4)),
+            secondary_y=True
+        )
+        
+        fig_wave.update_layout(hovermode="x unified", barmode='group', height=450, margin=dict(t=30))
+        fig_wave.update_yaxes(title_text="Cardio Load (TRIMP)", secondary_y=False)
+        fig_wave.update_yaxes(title_text="Mechanical Load", secondary_y=True)
+        
+        st.plotly_chart(fig_wave, use_container_width=True)
+    
+    st.markdown("---")
+    st.subheader("📈 Longitudinal Team ACWR Trend (Macrocycle)")
+    
+    team_trend = df.groupby('Date_Obj')['Combined_ACWR'].mean().reset_index().sort_values('Date_Obj')
+    fig_trend = go.Figure()
+    fig_trend.add_trace(go.Scatter(x=team_trend['Date_Obj'], y=team_trend['Combined_ACWR'], mode='lines+markers', name="Team ACWR", line=dict(color='black', width=3)))
+    
+    fig_trend.add_hrect(y0=0, y1=0.8, fillcolor="#87CEFA", opacity=0.3, layer="below", line_width=0, annotation_text="Undertrained", annotation_position="top left")
+    fig_trend.add_hrect(y0=0.8, y1=1.3, fillcolor="#90ee90", opacity=0.3, layer="below", line_width=0, annotation_text="Sweet Spot", annotation_position="top left")
+    fig_trend.add_hrect(y0=1.3, y1=1.5, fillcolor="#ffd700", opacity=0.3, layer="below", line_width=0, annotation_text="Caution", annotation_position="top left")
+    fig_trend.add_hrect(y0=1.5, y1=3.0, fillcolor="#ff6b6b", opacity=0.3, layer="below", line_width=0, annotation_text="Danger Zone", annotation_position="top left")
+    
+    fig_trend.update_layout(yaxis_title="Combined ACWR", xaxis_title="Date", height=450, yaxis=dict(range=[0, max(2.0, team_trend['Combined_ACWR'].max() + 0.2)]))
+    st.plotly_chart(fig_trend, use_container_width=True)
+
+# --- TAB 3: SQUAD BASELINES & ATHLETE PROFILES ---
+with tab_individual:
+    st.markdown(f"### 📅 Weekly Team Baselines (Week of {start_of_week.strftime('%m/%d')} - {end_of_week.strftime('%m/%d')})")
+    
+    format_dict_daily = {
+        'Avg TRIMP': '{:.2f}', 'Avg Accel Load': '{:.2f}', 
+        'Avg Distance (mi)': '{:.2f}', 'Max Speed (mph)': '{:.2f}', 'Max Jump Height': '{:.2f}'
+    }
+    render_custom_table(daily_avg, format_dict_daily)
+        
+    st.markdown("---")
+    st.markdown("### 🏆 Overall Season Team Averages")
+    
+    team_season_avg = df[['TRIMP (Index)', 'Accumulated Acceleration Load', 'Distance (mi)', 'Speed (max.) (mph)', 'Max Jump Height']].mean().to_frame().T
+    team_season_avg.columns = ['Avg TRIMP', 'Avg Accel Load', 'Avg Distance (mi)', 'Avg Max Speed (mph)', 'Avg Max Jump']
+    
+    format_dict_season = {col: '{:.2f}' for col in team_season_avg.columns}
+    render_custom_table(team_season_avg, format_dict_season)
+
+    st.markdown("---")
+    st.markdown("### 👤 Individual Historical Drill-Down")
+    
+    players = sorted(df['Player'].dropna().unique().tolist())
+    selected_player = st.selectbox("Filter to specific Athlete:", players)
+    player_data = df[df['Player'] == selected_player].sort_values(by='Date_Obj', ascending=False)
+    
+    if not player_data.empty:
+        latest_session = player_data.iloc[0]
+        
+        all_time_max_speed = player_data['Speed (max.) (mph)'].max()
+        all_time_max_jump = player_data['Max Jump Height'].max()
+        
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric(label="Latest TRIMP", value=f"{latest_session['TRIMP (Index)']:.2f}")
+        c2.metric(label="Latest Accel Load", value=f"{latest_session['Accumulated Acceleration Load']:.2f}")
+        c3.metric(label="All-Time Max Speed", value=f"{all_time_max_speed:.2f}")
+        c4.metric(label="All-Time Max Jump", value=f"{all_time_max_jump:.2f}")
+        c5.metric(label="Latest Distance (mi)", value=f"{latest_session['Distance (mi)']:.2f}")
+
+        st.write("#### Historical Output Log")
+        
+        history_display = player_data[[
+            'Date_Str', 'TRIMP (Index)', 'Accumulated Acceleration Load', 
+            'Combined_ACWR', 'Distance (mi)', 'Speed (max.) (mph)', 'Max Jump Height'
+        ]].rename(columns={
+            'Date_Str': 'Date',
+            'TRIMP (Index)': 'Cardio (TRIMP)',
+            'Accumulated Acceleration Load': 'Mech Load (Accel)',
+            'Combined_ACWR': 'Combined ACWR',
+            'Distance (mi)': 'Mileage (mi)',
+            'Speed (max.) (mph)': 'Max Speed (mph)',
+            'Max Jump Height': 'Max Jump Height'
+        })
+        
+        format_dict_history = {
+            'Cardio (TRIMP)': '{:.2f}', 'Mech Load (Accel)': '{:.2f}', 
+            'Combined ACWR': '{:.2f}', 'Mileage (mi)': '{:.2f}',
+            'Max Speed (mph)': '{:.2f}', 'Max Jump Height': '{:.2f}'
+        }
+        
+        render_custom_table(history_display, format_dict_history, highlight_cols=['Max Speed (mph)', 'Max Jump Height'])
