@@ -1,0 +1,55 @@
+name: AMS daily data imports
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'automation/ams/**'
+      - '.github/workflows/ams-refresh.yml'
+  schedule:
+    - cron: '45 23 * * *'
+      timezone: America/Chicago
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ams-daily-imports
+  cancel-in-progress: false
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [kinexon, firstbeat]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify recovery and saved-data checks
+        run: node --test automation/ams/tests/updater.test.mjs
+      - name: Import and independently verify saved data
+        env:
+          AMS_SITE_TOKEN: ${{ secrets.AMS_SITE_TOKEN }}
+        run: node automation/ams/ams-updater.mjs ${{ matrix.source }}
+
+  keep-schedule-active:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Keep the public repository schedule active
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node automation/ams/keep-schedule-active.mjs
