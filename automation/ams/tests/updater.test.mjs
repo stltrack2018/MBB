@@ -62,6 +62,19 @@ test('a daily run respects the server retry time, then resumes without hourly jo
   assert.equal(result.refreshComplete, true);
 });
 
+test('one daily run can resume across multiple hour-long provider cooldowns', async () => {
+  let clock = Date.parse(completedAt), calls = 0;
+  const result = await refreshSource('firstbeat', {
+    now: () => clock, wait: async ms => { clock += ms; },
+    request: async path => {
+      if (!path.includes('read=1') && calls++ < 2) return { ...firstbeatStatus(), complete: false, refreshState: 'backoff', retryAt: new Date(clock + 61 * 60000).toISOString() };
+      return path.includes('status=1') ? firstbeatStatus() : firstbeatData();
+    },
+  });
+  assert.equal(clock, Date.parse(completedAt) + 122 * 60000);
+  assert.equal(result.refreshComplete, true);
+});
+
 test('lost response resumes from server status without force or duplicate data writes', async () => {
   const paths = []; let mutationCalls = 0;
   const request = async path => {
