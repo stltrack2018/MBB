@@ -74,7 +74,7 @@ export async function readVerified(source, request) {
 
 export async function refreshSource(source, {
   request = createClient(), wait = pause, now = Date.now,
-  verifyOnly = false, maxSteps = 250, budgetMs = 110 * 60000,
+  verifyOnly = false, maxSteps = 750, budgetMs = 270 * 60000,
 } = {}) {
   requireValue(SOURCES.has(source), 'Choose kinexon or firstbeat');
   if (verifyOnly) return readVerified(source, request);
